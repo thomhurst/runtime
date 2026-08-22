@@ -258,8 +258,7 @@ namespace System.Threading
                 // Attempt to get the value using the fast path
                 //
                 if (slotArray != null   // Has the slot array been initialized?
-                    && id >= 0   // Is the ID non-negative (i.e., instance is not disposed)?
-                    && id < slotArray.Length   // Is the table large enough?
+                    && (uint)id < (uint)slotArray.Length   // Is the ID non-negative and the table large enough?
                     && (slot = slotArray[id].Value) != null   // Has a LinkedSlot object has been allocated for this ID?
                     && _initialized // Has the instance *still* not been disposed (important for a race condition with Dispose)?
                 )
@@ -282,8 +281,7 @@ namespace System.Threading
 
                 // Attempt to set the value using the fast path
                 if (slotArray != null   // Has the slot array been initialized?
-                    && id >= 0   // Is the ID non-negative (i.e., instance is not disposed)?
-                    && id < slotArray.Length   // Is the table large enough?
+                    && (uint)id < (uint)slotArray.Length   // Is the ID non-negative and the table large enough?
                     && (slot = slotArray[id].Value) != null   // Has a LinkedSlot object has been allocated for this ID?
                     && _initialized // Has the instance *still* not been disposed (important for a race condition with Dispose)?
                     )
