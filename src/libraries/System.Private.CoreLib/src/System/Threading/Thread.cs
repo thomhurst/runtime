@@ -199,6 +199,11 @@ namespace System.Threading
         public static void Sleep(int millisecondsTimeout)
         {
             ArgumentOutOfRangeException.ThrowIfLessThan(millisecondsTimeout, Timeout.Infinite);
+            if (millisecondsTimeout != 0)
+            {
+                ThreadPoolWorkQueue.NotifyThreadBlocking();
+            }
+
             SleepInternal(millisecondsTimeout);
         }
 

@@ -111,9 +111,107 @@ namespace System.Threading
 
             private SpinLock m_foreignLock = new SpinLock(enableThreadOwnerTracking: false);
 
+            // The most recently queued local work item. The owning thread runs it as soon as its current work item returns.
+            // Other threads may only steal it once it has been waiting for at least RunNextStealDelayTicks, so that a
+            // continuation queued by a short work item stays on the same thread instead of bouncing between threads.
+            private object? m_runNext;
+
+            // To keep the clock off of the owner's queueing path, waiting times are measured by other threads, from the
+            // time they first see the run-next item or a non-empty array. The owner resets these to 0 when queueing into
+            // an empty slot or array. Precision is not important, these are only used for heuristics.
+            private long m_runNextSeenTimestamp;
+            private long m_arraySeenTimestamp;
+
+            private static long GetWaitTime(ref long seenTimestamp, long now)
+            {
+                long seen = Volatile.Read(ref seenTimestamp);
+                if (seen == 0)
+                {
+                    Interlocked.CompareExchange(ref seenTimestamp, now, 0);
+                    return 0;
+                }
+
+                return now - seen;
+            }
+
+            /// <summary>
+            /// Places the work item into the run-next slot if it is empty, otherwise into the queue.
+            /// </summary>
+            /// <returns>
+            /// true if the item was placed into the slot, in which case it is only reachable by other threads after the
+            /// steal delay; false if it was placed into the queue and is immediately available to be stolen.
+            /// </returns>
+            public bool LocalPushRunNext(object obj)
+            {
+                if (m_runNext is not null)
+                {
+                    // When queueing a burst of work items, only the first one goes to the run-next slot. Swapping each
+                    // new item into the slot would double the cost of queueing in that case.
+                    LocalPush(obj);
+                    return false;
+                }
+
+                if (m_runNextSeenTimestamp != 0)
+                {
+                    m_runNextSeenTimestamp = 0;
+                }
+
+                // The exchange is a full fence, so the caller's subsequent check for a pending thread request
+                // cannot be reordered before the item becomes visible.
+                object? prev = Interlocked.Exchange(ref m_runNext, obj);
+                if (prev is null)
+                {
+                    return true;
+                }
+
+                LocalPush(prev);
+                return false;
+            }
+
+            public bool HasRunNext => m_runNext is not null;
+
+            public bool HasArrayWork => m_headIndex < m_tailIndex;
+
+            private object? TakeRunNext() =>
+                m_runNext is not null ? Interlocked.Exchange(ref m_runNext, null) : null;
+
+            /// <summary>Makes the run-next item, if any, immediately available for stealing.</summary>
+            /// <remarks>
+            /// This may be called when the owning thread is about to block, including from within operations on this
+            /// queue, for instance when SpinLock contention leads to Thread.Sleep. So it must not modify the queue itself;
+            /// it only backdates the time at which the item was first seen.
+            /// </remarks>
+            public void ExposeRunNext()
+            {
+                if (m_runNext is not null)
+                {
+                    Volatile.Write(ref m_runNextSeenTimestamp, 1);
+                }
+            }
+
+            /// <summary>
+            /// Returns whether this queue holds work that has been waiting for longer than <paramref name="stallTicks"/>,
+            /// which suggests that the owning thread is busy or blocked and another thread should be requested.
+            /// </summary>
+            public bool HasStalledWork(long now, long stallTicks)
+            {
+                if (m_runNext is not null && GetWaitTime(ref m_runNextSeenTimestamp, now) > stallTicks)
+                {
+                    return true;
+                }
+
+                return m_headIndex < m_tailIndex && GetWaitTime(ref m_arraySeenTimestamp, now) > stallTicks;
+            }
+
             public void LocalPush(object obj)
             {
                 int tail = m_tailIndex;
+
+                if (tail <= m_headIndex && m_arraySeenTimestamp != 0)
+                {
+                    // The array is transitioning from empty to non-empty
+                    m_arraySeenTimestamp = 0;
+                }
 
                 // We're going to increment the tail; if we'll overflow, then we need to reset our counts
                 if (tail == int.MaxValue)
@@ -213,10 +311,16 @@ namespace System.Threading
 
             public bool LocalFindAndPop(object obj)
             {
+                if (m_runNext == obj && Interlocked.CompareExchange(ref m_runNext, null, obj) == obj)
+                {
+                    return true;
+                }
+
                 // Fast path: check the tail. If equal, we can skip the lock.
                 if (m_array[(m_tailIndex - 1) & m_mask] == obj)
                 {
-                    object? unused = LocalPop();
+                    // Pop from the array specifically, LocalPop would take the run-next item first
+                    object? unused = m_headIndex < m_tailIndex ? LocalPopCore() : null;
                     Debug.Assert(unused == null || unused == obj);
                     return unused != null;
                 }
@@ -267,7 +371,7 @@ namespace System.Threading
                 return false;
             }
 
-            public object? LocalPop() => m_headIndex < m_tailIndex ? LocalPopCore() : null;
+            public object? LocalPop() => TakeRunNext() ?? (m_headIndex < m_tailIndex ? LocalPopCore() : null);
 
             private object? LocalPopCore()
             {
@@ -331,13 +435,17 @@ namespace System.Threading
                 }
             }
 
-            public bool CanSteal => m_headIndex < m_tailIndex;
+            public bool CanSteal => m_headIndex < m_tailIndex || m_runNext is not null;
 
             public object? TrySteal(ref bool missedSteal)
             {
                 while (true)
                 {
-                    if (CanSteal)
+                    if (m_headIndex >= m_tailIndex)
+                    {
+                        return TryStealRunNext(ref missedSteal);
+                    }
+
                     {
                         bool taken = false;
                         try
@@ -383,6 +491,35 @@ namespace System.Threading
                 }
             }
 
+            private object? TryStealRunNext(ref bool missedSteal)
+            {
+                object? runNext = m_runNext;
+                if (runNext is null)
+                {
+                    return null;
+                }
+
+                if (GetWaitTime(ref m_runNextSeenTimestamp, Stopwatch.GetTimestamp()) >= s_runNextStealDelayTicks)
+                {
+                    if (Interlocked.CompareExchange(ref m_runNext, null, runNext) == runNext)
+                    {
+                        return runNext;
+                    }
+
+                    // Raced with the owner or another thief
+                    missedSteal = true;
+                }
+                else if (!ThreadPoolWorkQueue.s_deferWorkerRequests)
+                {
+                    // Too early to steal. Someone needs to look again. When worker requests are deferred, the owner is
+                    // responsible for the item, with stalled work detection as a backstop, so there is no need to keep
+                    // waking threads that would only find the item too early to steal.
+                    missedSteal = true;
+                }
+
+                return null;
+            }
+
             public int Count
             {
                 get
@@ -391,7 +528,7 @@ namespace System.Threading
                     try
                     {
                         m_foreignLock.Enter(ref lockTaken);
-                        return Math.Max(0, m_tailIndex - m_headIndex);
+                        return Math.Max(0, m_tailIndex - m_headIndex) + (m_runNext is not null ? 1 : 0);
                     }
                     finally
                     {
@@ -414,6 +551,129 @@ namespace System.Threading
                 "DOTNET_ThreadPool_PrioritizationExperiment",
                 defaultValue: false);
 #endif
+
+        // When enabled, the most recently queued local work item is held in a run-next slot that is protected from stealing
+        // for a short time. See WorkStealingQueue.LocalPushRunNext.
+        internal static readonly bool s_runNextEnabled =
+            AppContextConfigHelper.GetBooleanConfig("System.Threading.ThreadPool.RunNext", "DOTNET_ThreadPool_RunNext");
+
+        // When enabled (requires the run-next slot), queueing a work item into an empty run-next slot from a worker thread
+        // that is dispatching work does not request another worker thread. The owning thread will run the item when its
+        // current work item returns. If the owning thread blocks, it exposes the item and requests a worker; if it stays
+        // busy, stalled work detection by spinning workers and the gate thread requests a worker.
+        internal static readonly bool s_deferWorkerRequests =
+#if CORECLR
+            s_runNextEnabled &&
+#if TARGET_WINDOWS
+            !ThreadPool.UseWindowsThreadPool &&
+#endif
+            AppContextConfigHelper.GetBooleanConfig("System.Threading.ThreadPool.DeferWorkerRequests", "DOTNET_ThreadPool_DeferWorkerRequests");
+#else
+            false;
+#endif
+
+        // When enabled, Dispatch only requests another worker after its first dequeue if there is visible work left.
+        internal static readonly bool s_lazyDispatchRequest =
+            s_deferWorkerRequests &&
+            AppContextConfigHelper.GetBooleanConfig("System.Threading.ThreadPool.LazyDispatchRequest", "DOTNET_ThreadPool_LazyDispatchRequest");
+
+        internal static readonly long s_runNextStealDelayTicks = MicrosecondsToTicks(
+            AppContextConfigHelper.GetInt32Config("System.Threading.ThreadPool.RunNextStealDelayUs", "DOTNET_ThreadPool_RunNextStealDelayUs", 5, allowNegative: false));
+
+        internal static readonly long s_stalledWorkTicks = MicrosecondsToTicks(
+            AppContextConfigHelper.GetInt32Config("System.Threading.ThreadPool.StalledWorkUs", "DOTNET_ThreadPool_StalledWorkUs", 50, allowNegative: false));
+
+        private static long MicrosecondsToTicks(int us) => Stopwatch.Frequency * us / 1_000_000;
+
+        private static long s_lastStalledWorkCheckTimestamp;
+
+        /// <summary>
+        /// Called by spinning worker threads. Requests a worker if there is stealable or stalled local work.
+        /// </summary>
+        /// <param name="stopping">
+        /// true if the calling thread was the last spinner and is about to stop spinning. In that case a worker is
+        /// requested if there is any deferred work, since nobody else would be watching it.
+        /// </param>
+        /// <returns>true if there is deferred work, in which case the caller should keep spinning.</returns>
+        internal static bool OnWorkerSpin(bool stopping)
+        {
+            Debug.Assert(s_deferWorkerRequests);
+
+            long now = Stopwatch.GetTimestamp();
+            bool hasDeferredWork = false;
+            foreach (WorkStealingQueue queue in WorkStealingQueueList.Queues)
+            {
+                // Work in the array part of a queue can be stolen right away. Normally queueing it requests a worker,
+                // but that request may have been satisfied by a worker that didn't request another one (see
+                // s_lazyDispatchRequest), so request one here. This thread is spinning and will likely take it.
+                if (queue.HasArrayWork || queue.HasStalledWork(now, s_stalledWorkTicks))
+                {
+                    ThreadPool.EnsureWorkerRequested();
+                    return true;
+                }
+
+                hasDeferredWork |= queue.HasRunNext;
+            }
+
+            if (stopping && hasDeferredWork)
+            {
+                ThreadPool.EnsureWorkerRequested();
+            }
+
+            return hasDeferredWork;
+        }
+
+        /// <summary>
+        /// Requests a worker thread if any thread's local queue holds work that has been waiting for too long. Called
+        /// periodically by the gate thread, as a last resort.
+        /// </summary>
+        /// <returns>true if a worker was requested.</returns>
+        internal static bool CheckForStalledWork()
+        {
+            Debug.Assert(s_deferWorkerRequests);
+
+            // Throttle the scans, as they touch cache lines written by every worker thread
+            long now = Stopwatch.GetTimestamp();
+            long last = s_lastStalledWorkCheckTimestamp;
+            if (now - last < s_stalledWorkTicks / 2 ||
+                Interlocked.CompareExchange(ref s_lastStalledWorkCheckTimestamp, now, last) != last)
+            {
+                return false;
+            }
+
+            foreach (WorkStealingQueue queue in WorkStealingQueueList.Queues)
+            {
+                if (queue.HasStalledWork(now, s_stalledWorkTicks))
+                {
+                    ThreadPool.EnsureWorkerRequested();
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Called before the current thread blocks. If the thread is a thread pool worker holding a deferred run-next work
+        /// item, exposes it to other threads and requests a worker.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void NotifyThreadBlocking()
+        {
+            if (s_deferWorkerRequests &&
+                ThreadPoolWorkQueueThreadLocals.threadLocals is ThreadPoolWorkQueueThreadLocals tl &&
+                tl.workStealingQueue.CanSteal)
+            {
+                NotifyThreadBlockingSlow(tl);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void NotifyThreadBlockingSlow(ThreadPoolWorkQueueThreadLocals tl)
+        {
+            tl.workStealingQueue.ExposeRunNext();
+            ThreadPool.EnsureWorkerRequested();
+        }
 
         private const int ProcessorsPerAssignableWorkItemQueue = 16;
         private static readonly int s_assignableWorkItemQueueCount =
@@ -625,7 +885,25 @@ namespace System.Threading
                 ThreadPoolWorkQueueThreadLocals? tl;
                 if (!forceGlobal && (tl = ThreadPoolWorkQueueThreadLocals.threadLocals) != null)
                 {
-                    tl.workStealingQueue.LocalPush(callback);
+                    if (!s_runNextEnabled)
+                    {
+                        tl.workStealingQueue.LocalPush(callback);
+                    }
+                    else if (tl.workStealingQueue.LocalPushRunNext(callback) && s_deferWorkerRequests)
+                    {
+                        // Thread locals only exist on worker threads, which only run user code from Dispatch, so this
+                        // thread will run the item when its current work item returns. If this thread stays busy, a
+                        // spinning worker detects the stalled item and requests a worker for it. If there is no spinning
+                        // worker, request one, it will keep spinning while there is deferred work. The exchange in
+                        // LocalPushRunNext is a full fence, see LowLevelLifoSemaphore.StopSpinning.
+#if CORECLR
+                        if (PortableThreadPool.HasSpinningWorkers)
+                        {
+                            PortableThreadPool.ThreadPoolInstance.EnsureGateThreadRunning();
+                            return;
+                        }
+#endif
+                    }
                 }
                 else
                 {
@@ -826,6 +1104,37 @@ namespace System.Threading
             return null;
         }
 
+        private bool HasVisibleWork(ThreadPoolWorkQueueThreadLocals tl)
+        {
+            if (tl.workStealingQueue.CanSteal || !IsEmpty(highPriorityWorkItems) || !IsEmpty(workItems))
+            {
+                return true;
+            }
+
+#if CORECLR
+            if (s_prioritizationExperiment && !IsEmpty(lowPriorityWorkItems))
+            {
+                return true;
+            }
+#endif
+
+            foreach (WorkQueue queue in _assignableWorkItemQueues)
+            {
+                if (!IsEmpty(queue))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+
+#if FEATURE_MULTITHREADING
+            static bool IsEmpty(WorkQueue queue) => queue.IsEmpty;
+#else
+            static bool IsEmpty(WorkQueue queue) => queue.Count == 0;
+#endif
+        }
+
         [MethodImpl(MethodImplOptions.NoInlining)]
         private bool TryStartProcessingHighPriorityWorkItemsAndDequeue(
             ThreadPoolWorkQueueThreadLocals tl,
@@ -927,7 +1236,14 @@ namespace System.Threading
             // In a worst case the current workitem will indirectly depend on progress of other
             // items and that would lead to a deadlock if no one else checks the queue.
             // We must ensure at least one more worker is coming if the queue is not empty.
-            ThreadPool.EnsureWorkerRequested();
+            //
+            // When worker requests may be deferred, only request a worker if there is visible work left in this thread's
+            // queue or the global queues. Work left in other threads' local queues is either going to be run by the
+            // owning thread when its current work item returns, or picked up by stalled work detection.
+            if (!s_lazyDispatchRequest || missedSteal || workQueue.HasVisibleWork(tl))
+            {
+                ThreadPool.EnsureWorkerRequested();
+            }
 
             //
             // After this point, this method is no longer responsible for ensuring thread requests except for missed steals

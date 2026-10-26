@@ -109,6 +109,9 @@ namespace System.Threading
 
             private Scope(object obj, ObjectKind objectKind, int timeoutMs)
             {
+                // The thread is about to block on a lock or condition. Don't let deferred thread pool work wait for it.
+                ThreadPoolWorkQueue.NotifyThreadBlocking();
+
                 _object = obj;
                 _blockingInfo.Push(Unsafe.AsPointer(ref _object), objectKind, timeoutMs);
             }

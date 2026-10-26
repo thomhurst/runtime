@@ -30,6 +30,16 @@ namespace System.Threading
         private readonly short _maxSpinCount;
         private readonly short _threadWakeCooldownUsec;
         private readonly Action _onWait;
+        private readonly Func<bool, bool>? _onSpin;
+
+        // Number of threads currently spinning in WaitSlow
+        private int _spinnerCount;
+
+        // 1 while a thread is spinning beyond the usual limit at the request of the onSpin callback. Only one thread
+        // at a time does that.
+        private int _extendedSpinner;
+
+        public bool HasSpinners => Volatile.Read(ref _spinnerCount) != 0;
 
         // When we need to block threads we use a linked list of per-thread blockers.
         // When we need to wake a worker, we pop the topmost blocker and release it.
@@ -65,10 +75,11 @@ namespace System.Threading
         // the releasers are the hot threads that do the actual work (as opposed to threads who are parking/unparking).
         private int _pendingWake;
 
-        public LowLevelLifoSemaphore(Action onWait)
+        public LowLevelLifoSemaphore(Action onWait, Func<bool, bool>? onSpin = null)
         {
             _separated = default;
             _onWait = onWait;
+            _onSpin = onSpin;
 
             _maxSpinCount = AppContextConfigHelper.GetInt16ComPlusOrDotNetConfig(
                 "System.Threading.ThreadPool.UnfairSemaphoreSpinLimit",
@@ -109,11 +120,23 @@ namespace System.Threading
         private bool WaitSlow(int timeoutMs)
         {
             int spinsRemaining = Environment.IsSingleProcessor ? 0 : _maxSpinCount;
+            if (spinsRemaining <= 0)
+            {
+                return WaitNoSpin(timeoutMs);
+            }
 
+            Interlocked.Increment(ref _spinnerCount);
+
+            bool isExtendedSpinner = false;
             uint iteration = 0;
-            while (spinsRemaining > 0)
+            while (true)
             {
                 spinsRemaining -= Backoff.Exponential(iteration++);
+
+                // The callback may signal this semaphore, which would then be consumed below. It returns true if the
+                // spinning should continue past the usual limit, because there is work that this thread may soon need to
+                // pick up.
+                bool keepSpinning = _onSpin is not null && _onSpin(false);
 
                 Counts counts = _separated._counts;
                 if (counts.SignalCount != 0)
@@ -124,12 +147,49 @@ namespace System.Threading
                     if (countsBeforeUpdate == counts)
                     {
                         // we've consumed a signal
+                        StopSpinning(isExtendedSpinner);
                         return true;
+                    }
+                }
+
+                if (spinsRemaining <= 0)
+                {
+                    if (!keepSpinning)
+                    {
+                        break;
+                    }
+
+                    if (!isExtendedSpinner)
+                    {
+                        if (_extendedSpinner != 0 || Interlocked.Exchange(ref _extendedSpinner, 1) != 0)
+                        {
+                            // Another thread is already doing the extended spinning
+                            break;
+                        }
+
+                        isExtendedSpinner = true;
                     }
                 }
             }
 
+            StopSpinning(isExtendedSpinner);
             return WaitNoSpin(timeoutMs);
+        }
+
+        private void StopSpinning(bool isExtendedSpinner)
+        {
+            if (isExtendedSpinner)
+            {
+                Volatile.Write(ref _extendedSpinner, 0);
+            }
+
+            // The decrement is a full fence. Callers that skip signaling the semaphore because there is a spinner
+            // check for spinners after publishing their work, so either they see that there are no spinners, or the
+            // callback below sees their work.
+            if (Interlocked.Decrement(ref _spinnerCount) == 0)
+            {
+                _onSpin?.Invoke(true);
+            }
         }
 
         public bool WaitNoSpin(int timeoutMs)

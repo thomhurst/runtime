@@ -112,6 +112,11 @@ namespace System.Threading
         {
             Debug.Assert(millisecondsTimeout >= -1);
 
+            if (millisecondsTimeout != 0)
+            {
+                ThreadPoolWorkQueue.NotifyThreadBlocking();
+            }
+
             // The field value is modifiable via the public <see cref="WaitHandle.SafeWaitHandle"/> property, save it locally
             // to ensure that one instance is used in all places in this method
             SafeWaitHandle? waitHandle = _waitHandle;
@@ -307,6 +312,11 @@ namespace System.Threading
             }
             ArgumentOutOfRangeException.ThrowIfLessThan(millisecondsTimeout, -1);
 
+            if (millisecondsTimeout != 0)
+            {
+                ThreadPoolWorkQueue.NotifyThreadBlocking();
+            }
+
             SynchronizationContext? context = SynchronizationContext.Current;
             bool useWaitContext = context != null && context.IsWaitNotificationRequired();
             SafeWaitHandle?[]? safeWaitHandles = RentSafeWaitHandleArray(waitHandles.Length);
@@ -452,6 +462,11 @@ namespace System.Threading
             ArgumentNullException.ThrowIfNull(toWaitOn);
 
             ArgumentOutOfRangeException.ThrowIfLessThan(millisecondsTimeout, -1);
+
+            if (millisecondsTimeout != 0)
+            {
+                ThreadPoolWorkQueue.NotifyThreadBlocking();
+            }
 
             // The field value is modifiable via the public <see cref="WaitHandle.SafeWaitHandle"/> property, save it locally
             // to ensure that one instance is used in all places in this method

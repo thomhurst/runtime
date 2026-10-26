@@ -16,6 +16,7 @@ namespace System.Threading
             private const uint DequeueDelayThresholdMs = GateActivitiesPeriodMs * 2;
             private const int GateThreadRunningMask = 0x4;
             private const int MaxRuns = 2;
+            private const uint StalledWorkCheckPeriodMs = 1;
 
             private static readonly AutoResetEvent RunGateThreadEvent = new AutoResetEvent(initialState: true);
             private static readonly AutoResetEvent DelayEvent = new AutoResetEvent(initialState: false);
@@ -67,8 +68,30 @@ namespace System.Threading
 
                     while (true)
                     {
-                        bool wasSignaledToWake = DelayEvent.WaitOne((int)delayHelper.GetNextDelay(currentTimeMs));
-                        currentTimeMs = Environment.TickCount;
+                        uint nextGateDelayMs = delayHelper.GetNextDelay(currentTimeMs);
+                        bool wasSignaledToWake;
+                        if (!ThreadPoolWorkQueue.s_deferWorkerRequests)
+                        {
+                            wasSignaledToWake = DelayEvent.WaitOne((int)nextGateDelayMs);
+                            currentTimeMs = Environment.TickCount;
+                        }
+                        else
+                        {
+                            // Worker requests may be deferred, check for stalled local work at a finer granularity than
+                            // the other gate activities. This is the backstop for the case where all other workers are
+                            // parked and a worker holding deferred work stays busy without blocking.
+                            int delayStartTimeMs = currentTimeMs;
+                            while (true)
+                            {
+                                wasSignaledToWake = DelayEvent.WaitOne((int)Math.Min(nextGateDelayMs, StalledWorkCheckPeriodMs));
+                                currentTimeMs = Environment.TickCount;
+                                ThreadPoolWorkQueue.CheckForStalledWork();
+                                if (wasSignaledToWake || (uint)(currentTimeMs - delayStartTimeMs) >= nextGateDelayMs)
+                                {
+                                    break;
+                                }
+                            }
+                        }
 
                         // Thread count adjustment for cooperative blocking
                         do

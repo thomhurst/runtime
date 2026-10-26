@@ -67,9 +67,12 @@ namespace System.Threading
                             NativeRuntimeEventSource.Log.ThreadPoolWorkerThreadWait(
                                 (uint)ThreadPoolInstance._separated.counts.VolatileRead().NumExistingThreads);
                         }
-                    });
+                    },
+                    onSpin: ThreadPoolWorkQueue.s_deferWorkerRequests ? ThreadPoolWorkQueue.OnWorkerSpin : null);
 
             private static readonly ThreadStart s_workerThreadStart = WorkerThreadStart;
+
+            public static bool HasSpinningWorkers => s_semaphore.HasSpinners;
 
             private static void CreateWorkerThread()
             {

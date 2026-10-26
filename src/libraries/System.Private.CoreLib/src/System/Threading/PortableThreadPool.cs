@@ -495,6 +495,11 @@ namespace System.Threading
             }
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void EnsureGateThreadRunning() => GateThread.EnsureRunning(this);
+
+        internal static bool HasSpinningWorkers => WorkerThread.HasSpinningWorkers;
+
         private bool OnGen2GCCallback()
         {
             // Gen 2 GCs may be very infrequent in some cases. If it becomes an issue, consider updating the memory usage more
